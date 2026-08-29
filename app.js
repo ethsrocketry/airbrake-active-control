@@ -17,7 +17,12 @@ function fmt(x, digits=3){ return Number.isFinite(Number(x)) ? Number(x).toFixed
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c])); }
 
 async function loadText(path){ return await (await fetch(path)).text(); }
-async function pyExec(code){ return await pyodide.runPythonAsync(code); }
+async function pyExec(code){
+  return await pyodide.runPythonAsync(`
+import json
+${code}
+`);
+}
 async function installSource(name, source){
   pyodide.globals.set(name, source);
   await pyExec(`exec(${name}, globals())`);
