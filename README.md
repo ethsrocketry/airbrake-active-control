@@ -44,3 +44,7 @@ The interface is static HTML/JavaScript and loads Pyodide in the browser. The si
 ## Input file
 
 Upload an OpenRocket-exported CSV named `ORI.csv`. The interface writes it to the browser-side path expected by the simulation: `/content/ORI.csv`.
+
+## Site logo and favicon
+
+The site looks for a root-level `logo.png` and uses that same file for the header logo and browser favicon. The default repository does not include a binary PNG placeholder so pull request tooling can handle the patch; upload your own `logo.png` at the repository root when you are ready to brand the site.
