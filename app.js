@@ -1,10 +1,11 @@
-import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v314.0.6/full/pyodide.mjs";
+import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v0.28.0/full/pyodide.mjs";
 
-const PYODIDE_INDEX = "https://cdn.jsdelivr.net/pyodide/v314.0.6/full/";
+const PYODIDE_INDEX = "https://cdn.jsdelivr.net/pyodide/v0.28.0/full/";
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 let pyodide = null;
 let currentFile = null;
+let currentFileBytes = null;
 const charts = [];
 
 function log(message) {
@@ -17,7 +18,15 @@ function clearCharts(){ while(charts.length){ charts.pop().destroy(); } }
 function fmt(x, digits=3){ return Number.isFinite(Number(x)) ? Number(x).toFixed(digits) : "—"; }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c])); }
 
-async function loadText(path){ return await (await fetch(path)).text(); }
+async function loadText(path){
+  const response = await fetch(path);
+
+  if(!response.ok){
+    throw new Error(`Unable to load ${path}: ${response.status} ${response.statusText}`);
+  }
+
+  return await response.text();
+}
 
 async function pyExec(code){
   return await pyodide.runPythonAsync(`import json
@@ -27,6 +36,25 @@ ${code}`);
 async function installSource(name, source){
   pyodide.globals.set(name, source);
   await pyExec(`exec(${name}, globals())`);
+}
+
+function saveCurrentFileToPyodide(){
+  if(!pyodide || !currentFileBytes){
+    return false;
+  }
+
+  try{
+    pyodide.FS.mkdirTree("/content");
+  }catch(_){
+    // Directory already exists.
+  }
+
+  pyodide.FS.writeFile("/content/ORI.csv",currentFileBytes);
+  return true;
+}
+
+function setFileLoadedStatus(file){
+  $("#file-status").innerHTML=`<b>${escapeHtml(file.name)}</b> loaded as <code>/content/ORI.csv</code>`;
 }
 
 async function init(){
@@ -62,7 +90,13 @@ sys.modules.setdefault('google.colab', types.ModuleType('google.colab'))`);
     // notebook contains top-level setup/run code that expects UI variables such as kp_low.
     await installSource("ADAPTER_SOURCE", sources[2]);
 
-    log("Simulation source loaded. Upload an OpenRocket CSV to begin.");
+    if(currentFile && saveCurrentFileToPyodide()){
+      setFileLoadedStatus(currentFile);
+      log(`Loaded ${currentFile.name} (${currentFileBytes.byteLength.toLocaleString()} bytes) as /content/ORI.csv.`);
+      log("Simulation source loaded. Choose a program and run it when ready.");
+    }else{
+      log("Simulation source loaded. Upload an OpenRocket CSV to begin.");
+    }
   }catch(err){
     console.error(err);
     $("#runtime-status").textContent="Engine failed";
@@ -103,22 +137,16 @@ $("#ori-file").addEventListener("change", async e=>{
   if(!file) return;
 
   currentFile=file;
-  const bytes=new Uint8Array(await file.arrayBuffer());
+  currentFileBytes=new Uint8Array(await file.arrayBuffer());
 
   if(!pyodide){
-    $("#file-status").textContent="Python engine is still loading…";
+    $("#file-status").textContent="Python engine is still loading. Your CSV will be installed automatically when it is ready…";
     return;
   }
 
-  try{
-    pyodide.FS.mkdirTree("/content");
-  }catch(_){
-    // Directory already exists.
-  }
-
-  pyodide.FS.writeFile("/content/ORI.csv",bytes);
-  $("#file-status").innerHTML=`<b>${escapeHtml(file.name)}</b> loaded as <code>/content/ORI.csv</code>`;
-  log(`Loaded ${file.name} (${bytes.byteLength.toLocaleString()} bytes) as /content/ORI.csv.`);
+  saveCurrentFileToPyodide();
+  setFileLoadedStatus(file);
+  log(`Loaded ${file.name} (${currentFileBytes.byteLength.toLocaleString()} bytes) as /content/ORI.csv.`);
 });
 
 $$('.tab').forEach(btn=>btn.addEventListener('click',()=>{
