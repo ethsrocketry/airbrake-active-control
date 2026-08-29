@@ -1,12 +1,13 @@
-import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v0.28.0/full/pyodide.mjs";
-
-const PYODIDE_INDEX = "https://cdn.jsdelivr.net/pyodide/v0.28.0/full/";
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
-let pyodide = null;
+let simWorker = null;
+let workerReady = false;
+let nextWorkerMessageId = 1;
+const pendingWorkerMessages = new Map();
 let currentFile = null;
 let currentFileBytes = null;
 const charts = [];
+let progressTimer = null;
 
 function log(message) {
   const el = $("#log");
@@ -15,6 +16,15 @@ function log(message) {
 }
 
 function clearCharts(){ while(charts.length){ charts.pop().destroy(); } }
+function destroyChartsIn(element){
+  for(let i=charts.length-1;i>=0;i--){
+    const canvas=charts[i].canvas;
+    if(element.contains(canvas)){
+      charts[i].destroy();
+      charts.splice(i,1);
+    }
+  }
+}
 function fmt(x, digits=3){ return Number.isFinite(Number(x)) ? Number(x).toFixed(digits) : "—"; }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c])); }
 
@@ -28,28 +38,30 @@ async function loadText(path){
   return await response.text();
 }
 
-async function pyExec(code){
-  return await pyodide.runPythonAsync(`import json
-${code}`);
+function workerCall(type, payload={}){
+  if(!simWorker){
+    throw new Error("The simulation worker has not started yet.");
+  }
+
+  const id=nextWorkerMessageId++;
+
+  return new Promise((resolve,reject)=>{
+    pendingWorkerMessages.set(id,{resolve,reject});
+    simWorker.postMessage({id,type,payload});
+  });
 }
 
-async function installSource(name, source){
-  pyodide.globals.set(name, source);
-  await pyExec(`exec(${name}, globals())`);
+async function pyExec(code, globals={}){
+  return await workerCall('runPython',{code,globals});
 }
 
-function saveCurrentFileToPyodide(){
-  if(!pyodide || !currentFileBytes){
+async function saveCurrentFileToPyodide(){
+  if(!workerReady || !currentFileBytes){
     return false;
   }
 
-  try{
-    pyodide.FS.mkdirTree("/content");
-  }catch(_){
-    // Directory already exists.
-  }
-
-  pyodide.FS.writeFile("/content/ORI.csv",currentFileBytes);
+  await workerCall('writeFile',{bytes:currentFileBytes.buffer}, [currentFileBytes.buffer]);
+  currentFileBytes=new Uint8Array(currentFileBytes);
   return true;
 }
 
@@ -59,9 +71,20 @@ function setFileLoadedStatus(file){
 
 async function init(){
   try{
-    pyodide = await loadPyodide({indexURL:PYODIDE_INDEX});
-    $("#runtime-status").textContent = "Python engine ready";
-    log("Pyodide ready. Loading scientific Python packages used by the original simulations…");
+    simWorker = new Worker("sim_worker.js", {type:"module"});
+    simWorker.onmessage=event=>{
+      const {id,ok,result,error}=event.data;
+      const pending=pendingWorkerMessages.get(id);
+      if(!pending) return;
+      pendingWorkerMessages.delete(id);
+      if(ok){
+        pending.resolve(result);
+      }else{
+        pending.reject(new Error(error));
+      }
+    };
+
+    log("Starting background simulation worker so long runs do not freeze the page…");
 
     const sources = await Promise.all([
       loadText("source/EML26_Base_Sim.py"),
@@ -69,28 +92,20 @@ async function init(){
       loadText("browser_adapter.py")
     ]);
 
-    // Browser/Colab bridge: the original source checks for 'google.colab' to choose /content/ORI.csv.
-    // We provide only that module marker; the simulation logic itself is unchanged.
-    await pyExec(`import sys, types
-sys.modules.setdefault('google.colab', types.ModuleType('google.colab'))`);
+    log("Worker ready. Loading scientific Python packages used by the original simulations…");
 
-    await pyodide.loadPackagesFromImports(sources[0]);
-    await pyodide.loadPackagesFromImports(sources[1]);
+    await workerCall('init',{
+      sources:{
+        base:sources[0],
+        sitl:sources[1],
+        adapter:sources[2]
+      }
+    });
 
-    // Both original simulation programs define run_simulation(). Keep separate aliases
-    // so the UI can call the correct original program instead of one overwriting the other.
-    await installSource("BASE_SOURCE", sources[0]);
-    await pyExec("BASE_RUN_SIMULATION = run_simulation");
+    workerReady = true;
+    $("#runtime-status").textContent = "Python worker ready";
 
-    await installSource("SITL_SOURCE", sources[1]);
-    await pyExec("SITL_RUN_SIMULATION = run_simulation");
-
-    // browser_adapter.py contains only the UI plumbing and optimizer wrapper.
-    // The original optimizer source is intentionally NOT executed here because the
-    // notebook contains top-level setup/run code that expects UI variables such as kp_low.
-    await installSource("ADAPTER_SOURCE", sources[2]);
-
-    if(currentFile && saveCurrentFileToPyodide()){
+    if(currentFile && await saveCurrentFileToPyodide()){
       setFileLoadedStatus(currentFile);
       log(`Loaded ${currentFile.name} (${currentFileBytes.byteLength.toLocaleString()} bytes) as /content/ORI.csv.`);
       log("Simulation source loaded. Choose a program and run it when ready.");
@@ -139,12 +154,12 @@ $("#ori-file").addEventListener("change", async e=>{
   currentFile=file;
   currentFileBytes=new Uint8Array(await file.arrayBuffer());
 
-  if(!pyodide){
+  if(!workerReady){
     $("#file-status").textContent="Python engine is still loading. Your CSV will be installed automatically when it is ready…";
     return;
   }
 
-  saveCurrentFileToPyodide();
+  await saveCurrentFileToPyodide();
   setFileLoadedStatus(file);
   log(`Loaded ${file.name} (${currentFileBytes.byteLength.toLocaleString()} bytes) as /content/ORI.csv.`);
 });
@@ -161,7 +176,7 @@ $$('[data-key="run_until"]').forEach(x=>x.addEventListener('change',setRunUntilV
 $("#clear-log").onclick=()=>$("#log").textContent="";
 
 function ensureFile(){
-  if(!pyodide) throw new Error("The Python engine is not ready yet.");
+  if(!workerReady) throw new Error("The Python worker is not ready yet.");
   if(!currentFile) throw new Error("Upload the OpenRocket CSV first. The site will save it internally as ORI.csv.");
 }
 
@@ -170,12 +185,49 @@ function busy(button,b){
   button.textContent=b?"Running…":button.dataset.label;
 }
 
+function startProgress(panel, label){
+  stopProgress(panel);
+  const card=panel.querySelector('.card');
+  const progress=document.createElement('div');
+  progress.className='sim-progress';
+  progress.innerHTML=`
+    <div class="progress-row">
+      <span>${escapeHtml(label)}</span>
+      <span class="progress-percent">0%</span>
+    </div>
+    <div class="progress-track"><div class="progress-fill"></div></div>
+  `;
+  card.appendChild(progress);
+
+  const fill=progress.querySelector('.progress-fill');
+  const pct=progress.querySelector('.progress-percent');
+  let value=0;
+  progressTimer=setInterval(()=>{
+    value=Math.min(95,value+(value<70?4:1));
+    fill.style.width=`${value}%`;
+    pct.textContent=`${value}%`;
+  },350);
+}
+
+function stopProgress(panel){
+  if(progressTimer){
+    clearInterval(progressTimer);
+    progressTimer=null;
+  }
+  const existing=panel.querySelector('.sim-progress');
+  if(existing){
+    existing.querySelector('.progress-fill').style.width='100%';
+    existing.querySelector('.progress-percent').textContent='100%';
+    existing.remove();
+  }
+}
+
 function showError(container,err){
   container.innerHTML=`<div class="error"><b>Simulation error</b><br><pre>${escapeHtml(err?.message||String(err))}</pre></div>`;
   log("ERROR: "+(err?.stack||err));
 }
 
-function makeChart(container, labels, datasets, title, yLabel){
+function makeChart(container, labels, datasets, title, yLabel, xLabel='Time (s)'){
   const card=document.createElement('div');
   card.className='chart-card';
 
@@ -214,7 +266,7 @@ function makeChart(container, labels, datasets, title, yLabel){
         x:{
           title:{
             display:true,
-            text:'Time (s)'
+            text:xLabel
           }
         },
         y:{
@@ -230,44 +282,115 @@ function makeChart(container, labels, datasets, title, yLabel){
   charts.push(chart);
 }
 
-function makePlotSelector(container, rows, plots){
-  const select=document.createElement('select');
-  select.className='plot-select';
+function makeOptions(select, options, selected){
+  select.innerHTML='';
+  for(const option of options){
+    const o=document.createElement('option');
+    o.value=option;
+    o.textContent=option;
+    if(option===selected) o.selected=true;
+    select.appendChild(o);
+  }
+}
 
+function makeDatasetSelect(columns, selected){
+  const select=document.createElement('select');
+  select.className='dataset-select';
+  makeOptions(select, columns, selected || columns[0]);
+  return select;
+}
+
+function makeGraphDashboard(container, rows, plots, options={}){
+  const xKey=options.xKey || 'time (s)';
+  const labels=options.labels || rows.map(r=>r[xKey]);
+  const columns=options.columns || (rows[0] ? Object.keys(rows[0]).filter(k=>k!==xKey) : []);
+  const dashboard=document.createElement('div');
+  dashboard.className='graph-dashboard';
+  dashboard.innerHTML=`
+    <div class="graph-toolbar">
+      <div>
+        <h3>Graphs</h3>
+        <p>Add as many preset or custom graphs as you need. Graphs automatically wrap side-by-side and below each other.</p>
+      </div>
+      <div class="graph-actions">
+        <select class="preset-select"></select>
+        <button class="small-btn add-preset" type="button">Add preset graph</button>
+        <button class="small-btn add-custom" type="button">Create custom graph</button>
+      </div>
+    </div>
+    <div class="chart-grid"></div>
+  `;
+  container.appendChild(dashboard);
+
+  const presetSelect=dashboard.querySelector('.preset-select');
   for(const [key,p] of Object.entries(plots)){
     const o=document.createElement('option');
     o.value=key;
     o.textContent=p.title;
-    select.appendChild(o);
+    presetSelect.appendChild(o);
   }
 
-  const holder=document.createElement('div');
-  container.append(select,holder);
+  const grid=dashboard.querySelector('.chart-grid');
 
-  function draw(){
-    holder.innerHTML='';
-    const p=plots[select.value];
+  function addGraph(config, custom=false){
+    const card=document.createElement('div');
+    card.className='graph-item';
+    const tools=document.createElement('div');
+    tools.className='graph-item-tools';
+    tools.innerHTML='<button class="small-btn remove-graph" type="button">Remove</button>';
+    card.appendChild(tools);
 
-    makeChart(
-      holder,
-      rows.map(r=>r['time (s)']),
-      p.datasets.map(d=>({
-        label:d.label,
-        data:rows.map(r=>r[d.key])
-      })),
-      p.title,
-      p.y
-    );
+    if(custom){
+      const builder=document.createElement('div');
+      builder.className='custom-builder';
+      const title=document.createElement('input');
+      title.placeholder='Graph title';
+      title.value=config.title || 'Custom Graph';
+      const y=document.createElement('input');
+      y.placeholder='Y-axis label';
+      y.value=config.y || '';
+      const first=makeDatasetSelect(columns, columns[0]);
+      const second=makeDatasetSelect(['',...columns], '');
+      builder.append('Title ',title,' Y label ',y,' Series 1 ',first,' Series 2 ',second);
+      card.appendChild(builder);
+      const redraw=()=>{
+        const datasets=[first.value,second.value].filter(Boolean).map(key=>({key,label:key}));
+        destroyChartsIn(chartHost);
+        chartHost.innerHTML='';
+        makeChart(chartHost, labels, datasets.map(d=>({label:d.label,data:rows.map(r=>r[d.key])})), title.value || 'Custom Graph', y.value, options.xLabel || xKey);
+      };
+      for(const el of [title,y,first,second]) el.addEventListener('input',redraw);
+      for(const el of [first,second]) el.addEventListener('change',redraw);
+      var chartHost=document.createElement('div');
+      card.appendChild(chartHost);
+      grid.appendChild(card);
+      redraw();
+    }else{
+      const chartHost=document.createElement('div');
+      card.appendChild(chartHost);
+      grid.appendChild(card);
+      makeChart(chartHost, labels, config.datasets.map(d=>({label:d.label,data:d.data || rows.map(r=>r[d.key])})), config.title, config.y, options.xLabel || xKey);
+    }
+
+    card.querySelector('.remove-graph').onclick=()=>{
+      destroyChartsIn(card);
+      card.remove();
+    };
   }
 
-  select.onchange=draw;
-  draw();
+  dashboard.querySelector('.add-preset').onclick=()=>addGraph(plots[presetSelect.value]);
+  dashboard.querySelector('.add-custom').onclick=()=>addGraph({title:'Custom Graph'}, true);
+
+  for(const key of Object.keys(plots).slice(0, options.initialCount || 2)){
+    addGraph(plots[key]);
+  }
 }
 
 $("#run-base").onclick=async()=>{
   const button=$("#run-base");
   button.dataset.label="Run EML26 Base";
   busy(button,true);
+  startProgress($("#panel-base"), "Running EML26 Base simulation…");
 
   const out=$("#base-results");
   out.innerHTML='';
@@ -286,13 +409,9 @@ $("#run-base").onclick=async()=>{
 
     log("Running EML26 Base with the original simulation core…");
 
-    pyodide.globals.set(
-      "UI_PARAMS_JSON",
-      JSON.stringify(p)
-    );
-
     const raw=await pyExec(
-      "json.dumps(run_base_ui(json.loads(UI_PARAMS_JSON)))"
+      "json.dumps(run_base_ui(json.loads(UI_PARAMS_JSON)))",
+      {UI_PARAMS_JSON:JSON.stringify(p)}
     );
 
     const r=JSON.parse(raw);
@@ -324,7 +443,7 @@ $("#run-base").onclick=async()=>{
     const plotWrap=document.createElement('div');
     out.appendChild(plotWrap);
 
-    makePlotSelector(plotWrap,r.rows,{
+    makeGraphDashboard(plotWrap,r.rows,{
       velocity_altitude:{
         title:'Velocity and Altitude',
         y:'Velocity / Altitude',
@@ -380,6 +499,7 @@ $("#run-base").onclick=async()=>{
   }catch(e){
     showError(out,e);
   }finally{
+    stopProgress($("#panel-base"));
     busy(button,false);
   }
 };
@@ -388,6 +508,7 @@ $("#run-sitl").onclick=async()=>{
   const button=$("#run-sitl");
   button.dataset.label="Run SITLSim 2026";
   busy(button,true);
+  startProgress($("#panel-sitl"), "Running SITLSim 2026 simulation…");
 
   const out=$("#sitl-results");
   out.innerHTML='';
@@ -427,13 +548,9 @@ $("#run-sitl").onclick=async()=>{
 
     log("Running SITLSim 2026 with the original simulation core…");
 
-    pyodide.globals.set(
-      "UI_PARAMS_JSON",
-      JSON.stringify(p)
-    );
-
     const raw=await pyExec(
-      "json.dumps(run_sitl_ui(json.loads(UI_PARAMS_JSON)))"
+      "json.dumps(run_sitl_ui(json.loads(UI_PARAMS_JSON)))",
+      {UI_PARAMS_JSON:JSON.stringify(p)}
     );
 
     const r=JSON.parse(raw);
@@ -467,7 +584,7 @@ $("#run-sitl").onclick=async()=>{
     const plotWrap=document.createElement('div');
     out.appendChild(plotWrap);
 
-    makePlotSelector(plotWrap,r.rows,{
+    makeGraphDashboard(plotWrap,r.rows,{
 
       velocity_altitude:{
         title:'Velocity and Altitude',
@@ -608,6 +725,7 @@ $("#run-sitl").onclick=async()=>{
   }catch(e){
     showError(out,e);
   }finally{
+    stopProgress($("#panel-sitl"));
     busy(button,false);
   }
 };
@@ -634,6 +752,68 @@ function downloadCsv(rows,name){
   URL.revokeObjectURL(a.href);
 }
 
+
+function makePdfDownload(text, name){
+  const lines=text.split('\n');
+  const objects=[];
+  const safe=line=>String(line).replace(/[\\()]/g, ch=>`\\${ch}`);
+  const stream=[
+    'BT',
+    '/F1 12 Tf',
+    '72 760 Td',
+    '14 TL',
+    ...lines.flatMap((line,index)=>[`${index===0?'':'T*'} (${safe(line)}) Tj`]),
+    'ET'
+  ].join('\n');
+
+  objects.push('<< /Type /Catalog /Pages 2 0 R >>');
+  objects.push('<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
+  objects.push('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>');
+  objects.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+  objects.push(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);
+
+  let pdf='%PDF-1.4\n';
+  const offsets=[0];
+  objects.forEach((object,index)=>{
+    offsets.push(pdf.length);
+    pdf+=`${index+1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xref=pdf.length;
+  pdf+=`xref\n0 ${objects.length+1}\n0000000000 65535 f \n`;
+  for(let i=1;i<offsets.length;i++){
+    pdf+=`${String(offsets[i]).padStart(10,'0')} 00000 n \n`;
+  }
+  pdf+=`trailer << /Size ${objects.length+1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  downloadText(pdf,name,'application/pdf');
+}
+
+function optimizerReportText(r){
+  const rows=(name,gains,apogees,time)=>[
+    '',
+    `${name} Optimization Detailed History - Search Duration: ${fmt(time,4)}s`,
+    'Iter | Value | Apogee (m)',
+    ...gains.map((gain,i)=>`${i+1} | ${Number(gain).toFixed(10)} | ${fmt(apogees[i],4)}`)
+  ].join('\n');
+
+  return [
+    'PID Control System Optimization Report',
+    'E-Town Rocket Bureau',
+    `Generated: ${new Date().toLocaleString()}`,
+    '',
+    'FINAL OPTIMIZED CONSTANTS',
+    '-------------------------',
+    `Kp: ${Number(r.best_kp).toFixed(10)}`,
+    `Kd: ${Number(r.best_kd).toFixed(10)}`,
+    `Ki: ${Number(r.best_ki).toFixed(10)}`,
+    '',
+    `Final Apogee: ${fmt(r.final_apogee,4)} m`,
+    `Target: ${fmt(r.target,4)} m`,
+    `Total Sim Time: ${fmt(r.total_duration,4)}s`,
+    rows('Kp', r.kp_hist, r.kp_apo_hist, r.kp_time),
+    rows('Kd', r.kd_hist, r.kd_apo_hist, r.kd_time),
+    rows('Ki', r.ki_hist, r.ki_apo_hist, r.ki_time)
+  ].join('\n');
+}
 function downloadText(text,name,type='application/json'){
   const a=document.createElement('a');
 
@@ -651,6 +831,7 @@ $("#run-optimizer").onclick=async()=>{
   const button=$("#run-optimizer");
   button.dataset.label="Run Optimizer";
   busy(button,true);
+  startProgress($("#panel-optimizer"), "Running optimizer simulations…");
 
   const out=$("#optimizer-results");
   out.innerHTML='';
@@ -670,21 +851,18 @@ $("#run-optimizer").onclick=async()=>{
         'kd_high',
         'ki_low',
         'ki_high',
-        'iterations'
+        'iterations',
+        'compute_mode'
       ]
     );
 
     log(
-      `Running optimizer: ${p.iterations} iterations × 3 gain searches, each using the original SITL simulation…`
-    );
-
-    pyodide.globals.set(
-      "UI_PARAMS_JSON",
-      JSON.stringify(p)
+      `Running optimizer in ${p.compute_mode === 'parallel' ? 'parallel browser-worker' : 'normal binary-search'} mode: ${p.iterations} iterations × 3 gain searches…`
     );
 
     const raw=await pyExec(
-      "json.dumps(run_optimizer_ui(json.loads(UI_PARAMS_JSON)))"
+      "json.dumps(run_optimizer_ui(json.loads(UI_PARAMS_JSON)))",
+      {UI_PARAMS_JSON:JSON.stringify(p)}
     );
 
     const r=JSON.parse(raw);
@@ -718,71 +896,60 @@ $("#run-optimizer").onclick=async()=>{
     const chartWrap=document.createElement('div');
     out.appendChild(chartWrap);
 
-    makeChart(
-      chartWrap,
-      r.kp_apo_hist.map((_,i)=>i+1),
-      [
-        {
-          label:'Kp search apogee',
-          data:r.kp_apo_hist
-        },
-        {
-          label:'Target',
-          data:r.kp_apo_hist.map(()=>r.target)
-        }
-      ],
-      'Kp Convergence',
-      'Apogee (m)'
-    );
+    const optimizerRows=r.kp_apo_hist.map((_,i)=>({
+      iteration:i+1,
+      'Kp search apogee':r.kp_apo_hist[i],
+      'Kd search apogee':r.kd_apo_hist[i],
+      'Ki search apogee':r.ki_apo_hist[i],
+      Target:r.target
+    }));
 
-    makeChart(
+    makeGraphDashboard(
       chartWrap,
-      r.kd_apo_hist.map((_,i)=>i+1),
-      [
-        {
-          label:'Kd search apogee',
-          data:r.kd_apo_hist
+      optimizerRows,
+      {
+        kp:{
+          title:'Kp Convergence',
+          y:'Apogee (m)',
+          datasets:[
+            {key:'Kp search apogee',label:'Kp search apogee'},
+            {key:'Target',label:'Target'}
+          ]
         },
-        {
-          label:'Target',
-          data:r.kd_apo_hist.map(()=>r.target)
-        }
-      ],
-      'Kd Convergence',
-      'Apogee (m)'
-    );
-
-    makeChart(
-      chartWrap,
-      r.ki_apo_hist.map((_,i)=>i+1),
-      [
-        {
-          label:'Ki search apogee',
-          data:r.ki_apo_hist
+        kd:{
+          title:'Kd Convergence',
+          y:'Apogee (m)',
+          datasets:[
+            {key:'Kd search apogee',label:'Kd search apogee'},
+            {key:'Target',label:'Target'}
+          ]
         },
-        {
-          label:'Target',
-          data:r.ki_apo_hist.map(()=>r.target)
+        ki:{
+          title:'Ki Convergence',
+          y:'Apogee (m)',
+          datasets:[
+            {key:'Ki search apogee',label:'Ki search apogee'},
+            {key:'Target',label:'Target'}
+          ]
         }
-      ],
-      'Ki Convergence',
-      'Apogee (m)'
+      },
+      {xKey:'iteration', initialCount:3}
     );
 
     const dl=document.createElement('div');
 
     dl.innerHTML=`
       <button class="download-btn" id="download-opt">
-        Download optimizer results JSON
+        Download optimizer PDF report
       </button>
     `;
 
     out.prepend(dl);
 
     $("#download-opt").onclick=()=>{
-      downloadText(
-        JSON.stringify(r,null,2),
-        'PID_Optimization_Results.json'
+      makePdfDownload(
+        optimizerReportText(r),
+        `PID_Optimization_Report_${new Date().toISOString().slice(0,16).replace(/[-:T]/g,'')}.pdf`
       );
     };
 
@@ -793,6 +960,7 @@ $("#run-optimizer").onclick=async()=>{
   }catch(e){
     showError(out,e);
   }finally{
+    stopProgress($("#panel-optimizer"));
     busy(button,false);
   }
 };

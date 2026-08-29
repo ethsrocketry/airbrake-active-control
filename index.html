@@ -4,16 +4,21 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Rocket Simulation Suite</title>
+  <link rel="icon" type="image/png" href="logo.png">
+  <link rel="apple-touch-icon" href="logo.png">
   <link rel="stylesheet" href="styles.css">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js"></script>
   <script type="module" src="app.js"></script>
 </head>
 <body>
   <header class="hero">
-    <div>
+    <div class="brand-lockup">
+      <img class="site-logo" src="logo.png" alt="Site logo" onerror="this.classList.add('missing-logo'); this.removeAttribute('src');">
+      <div>
       <p class="eyebrow">E-Town Rocket Bureau</p>
       <h1>Rocket Simulation Suite</h1>
       <p class="subtitle">Run the three Python simulations directly in your browser. No Python installation or server is required.</p>
+    </div>
     </div>
     <div class="runtime-pill" id="runtime-status">Starting Python engine…</div>
   </header>
@@ -136,6 +141,7 @@
           <div class="field"><label>Ki lower bound</label><input data-key="ki_low" value="0.0000001" type="number" step="any"><small>Smallest Ki the binary search may test.</small></div>
           <div class="field"><label>Ki upper bound</label><input data-key="ki_high" value="0.0001" type="number" step="any"><small>Largest Ki the binary search may test.</small></div>
           <div class="field"><label>Iterations per gain</label><input data-key="iterations" value="20" type="number" min="1" max="40" step="1"><small>The original optimizer uses 20. More iterations make the search narrower but run more full simulations.</small></div>
+          <div class="field"><label>Compute mode</label><select data-key="compute_mode"><option value="binary">Normal binary search</option><option value="parallel">Parallel browser workers</option></select><small>Normal mode is the default. Parallel mode uses browser Web Workers/local CPU cores for faster optimizer sweeps when supported.</small></div>
         </div>
         <button class="run-btn" id="run-optimizer">Run Optimizer</button>
       </div>
