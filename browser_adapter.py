@@ -71,7 +71,43 @@ def run_sitl_ui(params):
     }
 
 
-def binary_search_gain(gain_name, low, high, target, constant_gains, iterations=20):
+def _optimizer_sim_kwargs(params, target, gains):
+    return {
+        'target_height': target,
+        'theta0': float(params.get('theta0', 90)),
+        'lrod_h': float(params.get('lrod_h', 1.8288)),
+        'base_wind': float(params.get('base_wind', 7)),
+        'step': float(params.get('step', 0.001)),
+        'run_until': params.get('run_until', 'Apogee'),
+        'PID_TOGGLE': str(params.get('PID_TOGGLE', 'ON')),
+        'ctrl_kp': gains['kp'],
+        'ctrl_kd': gains['kd'],
+        'ctrl_ki': gains['ki'],
+        'ctrl_imu_error': float(params.get('ctrl_imu_error', 0.03)),
+        'ctrl_imu_delay': float(params.get('ctrl_imu_delay', 0.005)),
+        'ctrl_baro_error': float(params.get('ctrl_baro_error', 1.0)),
+        'ctrl_baro_delay': float(params.get('ctrl_baro_delay', 0.005)),
+        'ctrl_sd_delay': float(params.get('ctrl_sd_delay', 0.005)),
+        'ctrl_compute_delay': float(params.get('ctrl_compute_delay', 0.0)),
+        'servo_speed': float(params.get('servo_speed', 375)),
+        'brakes_max_A': float(params.get('brakes_max_A', 0.0013524)),
+        'servo_max_angle': float(params.get('servo_max_angle', 37.55)),
+        'brake_angle_cmd_expr': str(params.get('brake_angle_cmd_expr', 'brake_angle_cmd = 0.196 + 21942*A_needed + 4.07E+06*A_needed**2')),
+        'brake_angle_to_area_expr': str(params.get('brake_angle_to_area_expr', 'brake_angle_to_area = -5.19E-06 + 4.36E-05*angle + -1.96E-07*angle**2')),
+        'brake_area_to_cd_expr': str(params.get('brake_area_to_cd_expr', 'brake_area_to_cd = 1178*A_brakes + 11218*A_brakes**2'))
+    }
+
+def run_optimizer_eval(params):
+    target = float(params['target'])
+    gains = {
+        'kp': float(params.get('kp', 0)),
+        'kd': float(params.get('kd', 0)),
+        'ki': float(params.get('ki', 0))
+    }
+    SITL_RUN_SIMULATION('/content/ORI.csv', **_optimizer_sim_kwargs(params, target, gains))
+    return {'apogee': float(apogee)}
+
+def binary_search_gain(gain_name, low, high, target, constant_gains, params, iterations=20):
     import time
     start_time = time.time()
     history_gains = []
@@ -85,14 +121,7 @@ def binary_search_gain(gain_name, low, high, target, constant_gains, iterations=
         gains[gain_name] = mid
 
         # Run simulation
-        SITL_RUN_SIMULATION(
-            '/content/ORI.csv',
-            target_height=target,
-            base_wind=7,
-            ctrl_kp=gains['kp'],
-            ctrl_kd=gains['kd'],
-            ctrl_ki=gains['ki']
-        )
+        SITL_RUN_SIMULATION('/content/ORI.csv', **_optimizer_sim_kwargs(params, target, gains))
 
         current_apogee = apogee
 
@@ -134,6 +163,7 @@ def run_optimizer_ui(params):
         kp_high,
         target,
         {'kp':0,'kd':0,'ki':0},
+        params=params,
         iterations=iterations
     )
 
@@ -144,6 +174,7 @@ def run_optimizer_ui(params):
         kd_high,
         target,
         {'kp':best_kp,'kd':0,'ki':0},
+        params=params,
         iterations=iterations
     )
 
@@ -154,20 +185,14 @@ def run_optimizer_ui(params):
         ki_high,
         target,
         {'kp':best_kp,'kd':best_kd,'ki':0},
+        params=params,
         iterations=iterations
     )
 
     total_duration=time.time()-total_start
 
     # Final validation run
-    SITL_RUN_SIMULATION(
-        '/content/ORI.csv',
-        target_height=target,
-        base_wind=7,
-        ctrl_kp=best_kp,
-        ctrl_kd=best_kd,
-        ctrl_ki=best_ki
-    )
+    SITL_RUN_SIMULATION('/content/ORI.csv', **_optimizer_sim_kwargs(params, target, {'kp': best_kp, 'kd': best_kd, 'ki': best_ki}))
 
     final_apogee=apogee
 

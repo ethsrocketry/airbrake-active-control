@@ -8,6 +8,8 @@ let currentFile = null;
 let currentFileBytes = null;
 const charts = [];
 let progressTimer = null;
+let progressState = null;
+let sourceCache = null;
 
 function log(message) {
   const el = $("#log");
@@ -38,17 +40,46 @@ async function loadText(path){
   return await response.text();
 }
 
+function postWorkerCall(worker, type, payload={}){
+  const id=nextWorkerMessageId++;
+
+  return new Promise((resolve,reject)=>{
+    pendingWorkerMessages.set(id,{resolve,reject});
+    worker.postMessage({id,type,payload});
+  });
+}
+
 function workerCall(type, payload={}){
   if(!simWorker){
     throw new Error("The simulation worker has not started yet.");
   }
 
-  const id=nextWorkerMessageId++;
+  return postWorkerCall(simWorker,type,payload);
+}
 
-  return new Promise((resolve,reject)=>{
-    pendingWorkerMessages.set(id,{resolve,reject});
-    simWorker.postMessage({id,type,payload});
-  });
+function attachWorkerHandlers(worker){
+  worker.onmessage=event=>{
+    const {id,ok,result,error}=event.data;
+    const pending=pendingWorkerMessages.get(id);
+    if(!pending) return;
+    pendingWorkerMessages.delete(id);
+    if(ok){
+      pending.resolve(result);
+    }else{
+      pending.reject(new Error(error));
+    }
+  };
+}
+
+async function createSimulationWorker(){
+  const worker = new Worker("sim_worker.js", {type:"module"});
+  attachWorkerHandlers(worker);
+  await postWorkerCall(worker,'init',{sources:sourceCache});
+  if(currentFileBytes){
+    const bytes=new Uint8Array(currentFileBytes);
+    await postWorkerCall(worker,'writeFile',{bytes:bytes.buffer});
+  }
+  return worker;
 }
 
 async function pyExec(code, globals={}){
@@ -72,17 +103,7 @@ function setFileLoadedStatus(file){
 async function init(){
   try{
     simWorker = new Worker("sim_worker.js", {type:"module"});
-    simWorker.onmessage=event=>{
-      const {id,ok,result,error}=event.data;
-      const pending=pendingWorkerMessages.get(id);
-      if(!pending) return;
-      pendingWorkerMessages.delete(id);
-      if(ok){
-        pending.resolve(result);
-      }else{
-        pending.reject(new Error(error));
-      }
-    };
+    attachWorkerHandlers(simWorker);
 
     log("Starting background simulation worker so long runs do not freeze the page…");
 
@@ -91,15 +112,12 @@ async function init(){
       loadText("source/SITLSim_2026_core_browser.py"),
       loadText("browser_adapter.py")
     ]);
+    sourceCache = {base:sources[0], sitl:sources[1], adapter:sources[2]};
 
     log("Worker ready. Loading scientific Python packages used by the original simulations…");
 
     await workerCall('init',{
-      sources:{
-        base:sources[0],
-        sitl:sources[1],
-        adapter:sources[2]
-      }
+      sources:sourceCache
     });
 
     workerReady = true;
@@ -185,28 +203,44 @@ function busy(button,b){
   button.textContent=b?"Running…":button.dataset.label;
 }
 
-function startProgress(panel, label){
+function startProgress(panel, label, totalSteps=null){
   stopProgress(panel);
   const card=panel.querySelector('.card');
   const progress=document.createElement('div');
   progress.className='sim-progress';
   progress.innerHTML=`
     <div class="progress-row">
-      <span>${escapeHtml(label)}</span>
+      <span class="progress-label">${escapeHtml(label)}</span>
       <span class="progress-percent">0%</span>
     </div>
     <div class="progress-track"><div class="progress-fill"></div></div>
   `;
   card.appendChild(progress);
+  progressState={panel,label,totalSteps,completedSteps:0,value:0};
+  updateProgress(panel,0,label);
+  if(!totalSteps){
+    progressTimer=setInterval(()=>{
+      const cap=90;
+      const inc=Math.max(0.2,(cap-progressState.value)*0.04);
+      updateProgress(panel,Math.min(cap,progressState.value+inc));
+    },500);
+  }
+}
 
-  const fill=progress.querySelector('.progress-fill');
-  const pct=progress.querySelector('.progress-percent');
-  let value=0;
-  progressTimer=setInterval(()=>{
-    value=Math.min(95,value+(value<70?4:1));
-    fill.style.width=`${value}%`;
-    pct.textContent=`${value}%`;
-  },350);
+function updateProgress(panel, completedOrPercent, label=null){
+  const existing=panel.querySelector('.sim-progress');
+  if(!existing || !progressState) return;
+  let value;
+  if(progressState.totalSteps){
+    progressState.completedSteps=Math.min(progressState.totalSteps,completedOrPercent);
+    value=(progressState.completedSteps/progressState.totalSteps)*100;
+  }else{
+    value=completedOrPercent;
+  }
+  progressState.value=value;
+  existing.querySelector('.progress-fill').style.width=`${Math.max(0,Math.min(100,value))}%`;
+  existing.querySelector('.progress-percent').textContent=`${Math.round(value)}%`;
+  if(label) existing.querySelector('.progress-label').textContent=label;
 }
 
 function stopProgress(panel){
@@ -220,6 +254,7 @@ function stopProgress(panel){
     existing.querySelector('.progress-percent').textContent='100%';
     existing.remove();
   }
+  progressState=null;
 }
 
 function showError(container,err){
@@ -827,6 +862,81 @@ function downloadText(text,name,type='application/json'){
   URL.revokeObjectURL(a.href);
 }
 
+async function runParallelOptimizer(params, panel){
+  const workerCount=Math.max(2, Math.min(16, (navigator.hardwareConcurrency || 4) - 1));
+  const workers=[];
+  const totalRounds=Number(params.iterations)*3 + 1;
+  let completed=0;
+  const started=performance.now();
+
+  updateProgress(panel, completed, `Starting ${workerCount} optimizer workers…`);
+  for(let i=0;i<workerCount;i++) workers.push(await createSimulationWorker());
+
+  async function evaluate(candidate){
+    const worker=workers.shift();
+    try{
+      const raw=await postWorkerCall(worker,'runPython',{
+        code:'json.dumps(run_optimizer_eval(json.loads(UI_PARAMS_JSON)))',
+        globals:{UI_PARAMS_JSON:JSON.stringify({...params, ...candidate})}
+      });
+      return JSON.parse(raw);
+    }finally{
+      workers.push(worker);
+    }
+  }
+
+  async function tuneGain(name, low, high, fixed){
+    const hist=[];
+    const apoHist=[];
+    const t0=performance.now();
+    let best={gain:(low+high)/2, apogee:Infinity};
+    for(let round=0; round<Number(params.iterations); round++){
+      const points=Array.from({length:workerCount},(_,i)=>low + ((i+1)/(workerCount+1))*(high-low));
+      const results=await Promise.all(points.map(point=>evaluate({...fixed,[name]:point})));
+      results.forEach((result,i)=>{
+        const score=Math.abs(result.apogee-Number(params.target));
+        if(score < Math.abs(best.apogee-Number(params.target))) best={gain:points[i], apogee:result.apogee};
+      });
+      const below=[];
+      const above=[];
+      results.forEach((result,i)=>(result.apogee>Number(params.target)?above:below).push(points[i]));
+      if(above.length && below.length){
+        low=Math.max(...above);
+        high=Math.min(...below);
+      }else if(above.length){
+        low=Math.max(...above);
+      }else{
+        high=Math.min(...below);
+      }
+      hist.push(best.gain);
+      apoHist.push(best.apogee);
+      completed++;
+      updateProgress(panel, completed, `Optimizing ${name.toUpperCase()} (${round+1}/${params.iterations}) with ${workerCount} workers…`);
+    }
+    return {best:best.gain,hist,apoHist,time:(performance.now()-t0)/1000};
+  }
+
+  try{
+    const kp=await tuneGain('kp', Number(params.kp_low), Number(params.kp_high), {kp:0,kd:0,ki:0});
+    const kd=await tuneGain('kd', Number(params.kd_low), Number(params.kd_high), {kp:kp.best,kd:0,ki:0});
+    const ki=await tuneGain('ki', Number(params.ki_low), Number(params.ki_high), {kp:kp.best,kd:kd.best,ki:0});
+    const final=await evaluate({kp:kp.best,kd:kd.best,ki:ki.best});
+    completed++;
+    updateProgress(panel, completed, 'Final optimizer validation complete…');
+    return {
+      best_kp:kp.best,best_kd:kd.best,best_ki:ki.best,
+      kp_hist:kp.hist,kp_apo_hist:kp.apoHist,
+      kd_hist:kd.hist,kd_apo_hist:kd.apoHist,
+      ki_hist:ki.hist,ki_apo_hist:ki.apoHist,
+      kp_time:kp.time,kd_time:kd.time,ki_time:ki.time,
+      total_duration:(performance.now()-started)/1000,
+      final_apogee:final.apogee,target:Number(params.target),worker_count:workerCount
+    };
+  }finally{
+    workers.forEach(worker=>worker.terminate());
+  }
+}
+
 $("#run-optimizer").onclick=async()=>{
   const button=$("#run-optimizer");
   button.dataset.label="Run Optimizer";
@@ -852,7 +962,10 @@ $("#run-optimizer").onclick=async()=>{
         'ki_low',
         'ki_high',
         'iterations',
-        'compute_mode'
+        'compute_mode',
+        'theta0','lrod_h','base_wind','step','run_until','PID_TOGGLE',
+        'ctrl_imu_error','ctrl_imu_delay','ctrl_baro_error','ctrl_baro_delay',
+        'ctrl_sd_delay','ctrl_compute_delay','servo_speed','brakes_max_A','servo_max_angle'
       ]
     );
 
@@ -860,12 +973,18 @@ $("#run-optimizer").onclick=async()=>{
       `Running optimizer in ${p.compute_mode === 'parallel' ? 'parallel browser-worker' : 'normal binary-search'} mode: ${p.iterations} iterations × 3 gain searches…`
     );
 
-    const raw=await pyExec(
-      "json.dumps(run_optimizer_ui(json.loads(UI_PARAMS_JSON)))",
-      {UI_PARAMS_JSON:JSON.stringify(p)}
-    );
-
-    const r=JSON.parse(raw);
+    let r;
+    if(p.compute_mode === 'parallel'){
+      stopProgress($("#panel-optimizer"));
+      startProgress($("#panel-optimizer"), "Running parallel optimizer simulations…", Number(p.iterations)*3 + 1);
+      r=await runParallelOptimizer(p, $("#panel-optimizer"));
+    }else{
+      const raw=await pyExec(
+        "json.dumps(run_optimizer_ui(json.loads(UI_PARAMS_JSON)))",
+        {UI_PARAMS_JSON:JSON.stringify(p)}
+      );
+      r=JSON.parse(raw);
+    }
 
     out.innerHTML=`
       <div class="metric-grid">

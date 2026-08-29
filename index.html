@@ -98,6 +98,7 @@
           <div class="field"><label>Launch-rod height <span>m</span></label><input data-key="lrod_h" value="1.8288" type="number" step="any"><small>Launch-rod height used by ground/wind handling.</small></div>
           <div class="field"><label>Baseline wind <span>m/s</span></label><input data-key="base_wind" value="4.47" type="number" step="any"><small>Wind speed used by the wind-shear model.</small></div>
           <div class="field"><label>Simulation step <span>s</span></label><input data-key="step" value="0.001" type="number" step="any"><small>Numerical integration step; smaller = more computation.</small></div>
+          <div class="field"><label>Run until</label><select data-key="run_until"><option>Apogee</option><option>Recovery Deployment</option><option>Landing</option></select><small>Stop condition used for every optimizer candidate run.</small></div>
           <div class="field"><label>Run until</label><select data-key="run_until"><option>Recovery Deployment</option><option>Apogee</option><option>Landing</option><option value="numeric">Specific time (seconds)</option></select><input id="sitl-run-time" class="conditional hidden" type="number" step="any" placeholder="seconds"><small>Stop condition. Numeric time is in seconds. Descent/landing is not an accurate model.</small></div>
         </div>
         <div class="subhead">Control system inputs</div>
@@ -129,11 +130,25 @@
 
     <section class="app-panel" id="panel-optimizer">
       <div class="card">
-        <div class="section-head"><div><h2>Control System Optimizer 2026</h2><p>Sequential binary search: Kp → Kd → Ki, followed by a final validation simulation.</p></div></div>
-        <div class="callout"><b>What the optimizer actually does:</b> each candidate gain runs the original SITL simulation. If simulated apogee is above target, the search moves toward more control/drag. The optimizer uses <b>base_wind = 7 m/s</b> exactly as in the original notebook.</div>
+        <div class="section-head"><div><h2>Control System Optimizer 2026</h2><p>Sequential tuning: Kp → Kd → Ki, followed by a final validation simulation.</p></div></div>
+        <div class="callout"><b>What the optimizer actually does:</b> each candidate gain runs the original SITL simulation. If simulated apogee is above target, the search moves toward more control/drag. The optimizer now exposes the same flight, avionics, servo, and airbrake inputs used by SITL so candidate runs use your selected conditions.</div>
         <div class="form-grid">
           <div class="field"><label>Target apogee <span>m</span></label><input data-key="target" value="228.6" type="number" step="any"><small>Desired simulated apogee.</small></div>
-          <div class="field"><label>Initial mass <span>g</span></label><input data-key="m_init" value="475" type="number" step="any"><small>Kept because it is in the original setup. <b>Current optimizer code does not pass this value into the simulation, so it does not affect the search.</b></small></div>
+          <div class="field"><label>Launch angle <span>°</span></label><input data-key="theta0" value="90" type="number" step="any"><small>Initial rocket pitch. 90° = vertical.</small></div>
+          <div class="field"><label>Launch-rod height <span>m</span></label><input data-key="lrod_h" value="1.8288" type="number" step="any"><small>Launch-rod height used by ground/wind handling.</small></div>
+          <div class="field"><label>Baseline wind <span>m/s</span></label><input data-key="base_wind" value="7" type="number" step="any"><small>Wind speed used by optimizer candidate simulations.</small></div>
+          <div class="field"><label>Simulation step <span>s</span></label><input data-key="step" value="0.001" type="number" step="any"><small>Numerical integration step; smaller = more computation.</small></div>
+          <div class="field"><label>Run until</label><select data-key="run_until"><option>Apogee</option><option>Recovery Deployment</option><option>Landing</option></select><small>Stop condition used for every optimizer candidate run.</small></div>
+          <div class="field"><label>PID controller</label><select data-key="PID_TOGGLE"><option>ON</option><option>OFF</option></select><small>ON runs the airbrake controller during optimizer trials.</small></div>
+          <div class="field"><label>IMU error <span>m/s²</span></label><input data-key="ctrl_imu_error" value="0.03" type="number" step="any"><small>Magnitude of simulated IMU acceleration error.</small></div>
+          <div class="field"><label>IMU delay <span>s</span></label><input data-key="ctrl_imu_delay" value="0.005" type="number" step="any"><small>Simulated IMU response delay.</small></div>
+          <div class="field"><label>Barometer error <span>m</span></label><input data-key="ctrl_baro_error" value="1.0" type="number" step="any"><small>Magnitude of simulated barometer altitude error.</small></div>
+          <div class="field"><label>Barometer delay <span>s</span></label><input data-key="ctrl_baro_delay" value="0.005" type="number" step="any"><small>Simulated barometer response delay.</small></div>
+          <div class="field"><label>SD-card delay <span>s</span></label><input data-key="ctrl_sd_delay" value="0.005" type="number" step="any"><small>Simulated data-write delay.</small></div>
+          <div class="field"><label>Compute delay <span>s</span></label><input data-key="ctrl_compute_delay" value="0.000" type="number" step="any"><small>Simulated controller computation delay.</small></div>
+          <div class="field"><label>Servo speed <span>°/s</span></label><input data-key="servo_speed" value="375" type="number" step="any"><small>Maximum modeled servo rotation rate.</small></div>
+          <div class="field"><label>Maximum brake area <span>m²</span></label><input data-key="brakes_max_A" value="0.0013524" type="number" step="any"><small>Maximum total airbrake area.</small></div>
+          <div class="field"><label>Maximum servo angle <span>°</span></label><input data-key="servo_max_angle" value="37.55" type="number" step="any"><small>Maximum servo/airbrake angle.</small></div>
           <div class="field"><label>Kp lower bound</label><input data-key="kp_low" value="0.000001" type="number" step="any"><small>Smallest Kp the binary search may test.</small></div>
           <div class="field"><label>Kp upper bound</label><input data-key="kp_high" value="0.001" type="number" step="any"><small>Largest Kp the binary search may test.</small></div>
           <div class="field"><label>Kd lower bound</label><input data-key="kd_low" value="0.00000001" type="number" step="any"><small>Smallest Kd the binary search may test.</small></div>
@@ -141,7 +156,7 @@
           <div class="field"><label>Ki lower bound</label><input data-key="ki_low" value="0.0000001" type="number" step="any"><small>Smallest Ki the binary search may test.</small></div>
           <div class="field"><label>Ki upper bound</label><input data-key="ki_high" value="0.0001" type="number" step="any"><small>Largest Ki the binary search may test.</small></div>
           <div class="field"><label>Iterations per gain</label><input data-key="iterations" value="20" type="number" min="1" max="40" step="1"><small>The original optimizer uses 20. More iterations make the search narrower but run more full simulations.</small></div>
-          <div class="field"><label>Compute mode</label><select data-key="compute_mode"><option value="binary">Normal binary search</option><option value="parallel">Parallel browser workers</option></select><small>Normal mode is the default. Parallel mode uses browser Web Workers/local CPU cores for faster optimizer sweeps when supported.</small></div>
+          <div class="field"><label>Compute mode</label><select data-key="compute_mode"><option value="binary">Normal binary search</option><option value="parallel">Parallel browser workers</option></select><small>Normal mode is the default. Parallel mode launches a pool sized from available CPU cores and evaluates multiple bracket points per tuning round.</small></div>
         </div>
         <button class="run-btn" id="run-optimizer">Run Optimizer</button>
       </div>
