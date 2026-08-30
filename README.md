@@ -13,6 +13,7 @@ ATOS includes three main tools:
 - **Control System Optimizer** — a PID optimizer that searches for useful Kp, Kd, and Ki constants.
 
 > Important: parachute descent, landing, and descent-under-recovery behavior are not accurate in these simulations. Use ATOS mainly for ascent, apogee, and airbrake-control development.
+> ATOS Center of Pressure modeling is not yet programmed in. Center of Pressure is assumed to be 0.442 *for the moment*.
 
 ## Before You Start
 
